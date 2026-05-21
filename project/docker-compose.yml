@@ -1,0 +1,36 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: bonuscard_db
+      POSTGRES_USER: bonuscard_user
+      POSTGRES_PASSWORD: bonuscard_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://bonuscard_user:bonuscard_pass@db:5432/bonuscard_db
+      REDIS_URL: redis://redis:6379
+      SECRET_KEY: your-secret-key-here-change-in-production
+      POS_API_KEY: pos-api-key-12345
+      ALGORITHM: HS256
+      ACCESS_TOKEN_EXPIRE_MINUTES: 30
+    depends_on:
+      - db
+      - redis
+
+volumes:
+  postgres_data:
