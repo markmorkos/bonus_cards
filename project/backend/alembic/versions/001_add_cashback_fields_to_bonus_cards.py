@@ -1,4 +1,4 @@
-а """Add cashback_rate and transactions_count to bonus_cards
+"""Add cashback_rate and transactions_count to bonus_cards
 
 Revision ID: 001
 Revises: 
