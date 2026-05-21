@@ -1,9 +1,5 @@
 # Технічна документація: Система цифрових бонусних карток
 
-> Документ призначений для розробника або AI-агента, який продовжує роботу над проєктом.
-> Містить повний опис архітектури, бізнес-логіки, API та інструкції з тестування.
-
----
 
 ## Зміст
 
@@ -16,8 +12,9 @@
 7. [POS-інтеграція](#7-pos-інтеграція)
 8. [Адміністрування правил](#8-адміністрування-правил)
 9. [Мобільний застосунок (Flutter)](#9-мобільний-застосунок-flutter)
-10. [Тестування](#10-тестування)
-11. [Покроковий сценарій ручного тестування](#11-покроковий-сценарій-ручного-тестування)
+10. [Міграції бази даних](#10-міграції-бази-даних)
+11. [Тестування](#11-тестування)
+12. [Покроковий сценарій ручного тестування](#12-покроковий-сценарій-ручного-тестування)
 
 ---
 
@@ -102,13 +99,19 @@ created_at
 ```
 id (UUID)
 user_id → User
-card_number (унікальний, генерується)
+card_number (унікальний, генерується автоматично)
 qr_code_data (дані для QR-коду)
 balance (Decimal, поточний баланс бонусів)
+cashback_rate (Decimal, поточна ставка кешбеку %, default=3.00)
+transactions_count (Integer, кількість закритих рахунків, default=0)
+status (str: "active")
 level (str: "standard", "silver", "gold")
-is_active
 created_at
+updated_at
 ```
+
+> **Прогресія:** `cashback_rate = min(3 + transactions_count, 12)`  
+> З кожним новим нарахуванням `transactions_count` збільшується на 1, `cashback_rate` оновлюється автоматично.
 
 ### BonusTransaction — транзакція
 ```
@@ -118,25 +121,27 @@ type ("earn" або "spend")
 amount (Decimal, сума бонусів)
 balance_before (Decimal)
 balance_after (Decimal)
-purchase_amount (Decimal, сума покупки — тільки для earn)
+purchase_amount (Decimal, сума рахунку — для earn і spend)
 pos_terminal_id (str)
-rule_id → BonusRule (яке правило застосовано)
+rule_id → BonusRule (не використовується в поточній логіці прогресії)
 idempotency_key (унікальний ключ для захисту від дублів)
 description
 created_at
 ```
 
-### BonusRule — правило нарахування
+### BonusRule — правило нарахування (legacy)
 ```
 id (UUID)
 name (str)
 type ("percentage" | "fixed" | "multiplier")
-value (Decimal — відсоток, фіксована сума або множник)
-min_purchase (Decimal — мінімальна сума покупки)
-max_bonus (Decimal | None — максимальна сума бонусу)
+value (Decimal)
+min_purchase (Decimal)
+max_bonus (Decimal | None)
 is_active (bool)
 created_at
 ```
+
+> ⚠️ Модель `BonusRule` залишена для сумісності, але поточна логіка нарахування **не використовує** глобальні правила — ставка per-card і розраховується автоматично.
 
 ---
 
@@ -194,11 +199,7 @@ def create_access_token(subject: str) -> str:
     return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 ```
 
-`subject` = UUID користувача. Токен містить `sub` (user_id) та `exp` (час закінчення).
-
-### Верифікація токену у захищених ендпоінтах
-
-Заголовок: `Authorization: Bearer <токен>`
+`subject` = UUID користувача. Заголовок: `Authorization: Bearer <токен>`
 
 ---
 
@@ -206,50 +207,30 @@ def create_access_token(subject: str) -> str:
 
 ### Отримати свою картку
 
-**GET** `/cards/my`
-
-Заголовок: `Authorization: Bearer <токен>`
+**GET** `/cards/my` — заголовок: `Authorization: Bearer <токен>`
 
 Відповідь:
 ```json
 {
   "id": "uuid",
-  "card_number": "BC-00001",
-  "qr_code_data": "BONUS:BC-00001:uuid",
+  "card_number": "CARD_2C53F730B5",
+  "qr_code_data": "BONUS:CARD_2C53F730B5:uuid",
   "balance": "150.00",
+  "cashback_rate": "5.00",
+  "transactions_count": 2,
+  "status": "active",
   "level": "standard",
-  "is_active": true,
   "created_at": "2026-05-14T07:00:00Z"
 }
 ```
 
 ### Створити картку
 
-**POST** `/cards/create`
-
-Заголовок: `Authorization: Bearer <токен>`
-
-Якщо картка вже є — повертає існуючу (ідемпотентно).
+**POST** `/cards/create` — якщо картка вже є — повертає існуючу (ідемпотентно).
 
 ### Транзакції картки
 
 **GET** `/cards/{card_id}/transactions?limit=20&offset=0`
-
-Заголовок: `Authorization: Bearer <токен>`
-
-Відповідь — масив:
-```json
-[
-  {
-    "id": "uuid",
-    "type": "earn",
-    "amount": "50.00",
-    "balance_after": "150.00",
-    "created_at": "2026-05-14T07:00:00Z",
-    "description": "Нараховано 50 бонусів"
-  }
-]
-```
 
 ---
 
@@ -257,60 +238,84 @@ def create_access_token(subject: str) -> str:
 
 Файл: `project/backend/app/services/bonus_service.py`
 
-### Три типи правил
+### Прогресивна ставка кешбеку (per-card)
 
 ```python
-def _calculate_bonus(rule: BonusRule, purchase_amount: Decimal) -> Decimal:
-    if purchase_amount < Decimal(rule.min_purchase):
-        return Decimal("0.00")  # покупка занадто мала
+CASHBACK_MIN = Decimal("3.00")   # стартова ставка
+CASHBACK_MAX = Decimal("12.00")  # максимальна ставка
+CASHBACK_STEP = Decimal("1.00")  # крок підвищення за рахунок
 
-    if rule.type == "fixed":
-        # фіксована сума бонусів за будь-яку покупку
-        bonus = Decimal(rule.value)
+def _get_cashback_rate(card: BonusCard) -> Decimal:
+    rate = CASHBACK_MIN + CASHBACK_STEP * card.transactions_count
+    return min(rate, CASHBACK_MAX)
 
-    elif rule.type == "multiplier":
-        # бонуси = сума_покупки × 0.01 × множник
-        # наприклад: 500 грн × 0.01 × 5 = 25 бонусів
-        bonus = purchase_amount * Decimal("0.01") * Decimal(rule.value)
-
-    else:  # "percentage"
-        # бонуси = відсоток від суми покупки
-        # наприклад: 500 грн × 10% = 50 бонусів
-        bonus = purchase_amount * (Decimal(rule.value) / Decimal("100"))
-
-    # обмеження максимуму
-    if rule.max_bonus and bonus > Decimal(rule.max_bonus):
-        bonus = Decimal(rule.max_bonus)
-
-    return bonus.quantize(Decimal("0.01"))
+def _advance_cashback_rate(card: BonusCard) -> None:
+    card.transactions_count += 1
+    card.cashback_rate = min(
+        CASHBACK_MIN + CASHBACK_STEP * card.transactions_count,
+        CASHBACK_MAX,
+    )
 ```
 
-### Захист від дублікатів (ідемпотентність)
+**Таблиця прогресії:**
+
+| `transactions_count` | `cashback_rate` |
+|---|---|
+| 0 (нова картка) | 3% |
+| 1 | 4% |
+| 2 | 5% |
+| ... | ... |
+| 9+ | 12% |
+
+### Нарахування бонусів (`earn_bonus`)
 
 ```python
 async def earn_bonus(db, card, purchase_amount, terminal_id, idempotency_key):
-    # перевірка чи вже є транзакція з таким ключем
+    # 1. Захист від дублікатів
     existing = await db.execute(
-        select(BonusTransaction).where(
-            BonusTransaction.idempotency_key == idempotency_key
-        )
+        select(BonusTransaction).where(BonusTransaction.idempotency_key == idempotency_key)
     )
-    if existing:
-        return existing  # повертаємо старий результат, не дублюємо
+    if existing: return existing
+
+    # 2. Розрахунок за поточною ставкою картки
+    rate = _get_cashback_rate(card)
+    earned = (purchase_amount * rate / Decimal("100")).quantize(Decimal("0.01"))
+
+    # 3. Оновлення балансу
+    card.balance += earned
+
+    # 4. Підвищення ставки для наступного рахунку
+    _advance_cashback_rate(card)
+
+    # 5. Збереження транзакції + кеш Redis
     ...
 ```
 
-**Важливо:** `idempotency_key` має бути унікальним для кожної нової покупки. POS-термінал генерує його сам (наприклад, `order-12345`). Якщо запит повторити з тим самим ключем — бонуси не нарахуються двічі.
+### Списання бонусів (`spend_bonus`) — ліміт 50%
+
+```python
+SPEND_MAX_RATIO = Decimal("0.50")
+
+async def spend_bonus(db, card, amount, purchase_amount, terminal_id, idempotency_key):
+    # Перевірка: не більше 50% від суми рахунку
+    max_spendable = (purchase_amount * SPEND_MAX_RATIO).quantize(Decimal("0.01"))
+    if amount > max_spendable:
+        raise ValueError(f"Можна списати максимум 50% від суми рахунку ({max_spendable} грн)")
+
+    # Перевірка балансу
+    if card.balance < amount:
+        raise ValueError("Недостатньо бонусів на балансі")
+
+    card.balance -= amount
+    ...
+```
 
 ### Кешування балансу в Redis
 
 ```python
-# після нарахування — зберігаємо в Redis на 300 секунд
-await redis_client.set(
-    f"card:{card.id}:balance",
-    str(balance_after),
-    ex=settings.BONUS_CACHE_TTL
-)
+# після операції — зберігаємо в Redis на BONUS_CACHE_TTL секунд
+await redis_client.set(f"card:{card.id}:balance", str(balance_after), ex=settings.BONUS_CACHE_TTL)
+await redis_client.set(f"card:{card.id}:cashback_rate", str(card.cashback_rate), ex=settings.BONUS_CACHE_TTL)
 ```
 
 ---
@@ -319,16 +324,8 @@ await redis_client.set(
 
 ### Авторизація POS-терміналу
 
-Усі POS-запити перевіряються через заголовок:
 ```
 X-POS-API-Key: pos-api-key-12345
-```
-
-Код перевірки (`app/dependencies.py`):
-```python
-async def verify_pos_api_key(x_pos_api_key: str = Header(...)):
-    if x_pos_api_key != settings.POS_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid POS API key")
 ```
 
 ### Нарахування бонусів (покупка)
@@ -340,30 +337,26 @@ async def verify_pos_api_key(x_pos_api_key: str = Header(...)):
   "terminal_id": "TERM_001",
   "event_type": "purchase",
   "card_identifier": "CARD_2C53F730B5",
-  "purchase_amount": 500.00,
+  "purchase_amount": 1000.00,
   "idempotency_key": "order-20260514-001"
 }
 ```
-
-> ⚠️ **Обов'язкові поля:** `terminal_id`, `event_type`, `card_identifier`, `purchase_amount`, `idempotency_key`  
-> ❌ **Не використовувати:** `card_number`, `amount` — це старі/неіснуючі поля, сервер поверне 422
-
-- `card_identifier` — значення поля `card_number` або `qr_code_data` з відповіді `/cards/my`
-- `event_type` — завжди `"purchase"` для нарахування
-- `idempotency_key` — унікальний ID замовлення від каси
 
 Відповідь:
 ```json
 {
   "success": true,
   "transaction_id": "uuid",
-  "bonus_earned": "50.00",
-  "new_balance": "150.00",
-  "message": "Нараховано 50 бонусів"
+  "bonus_earned": "30.00",
+  "new_balance": "30.00",
+  "cashback_rate": "4.00",
+  "message": "Нараховано 30.00 бонусів (3% від 1000.00 грн). Наступна ставка: 4%"
 }
 ```
 
-### Списання бонусів (оплата бонусами)
+> `cashback_rate` у відповіді — це **нова** ставка, яка буде застосована до **наступного** рахунку.
+
+### Списання бонусів
 
 **POST** `/pos/spend`
 
@@ -371,61 +364,54 @@ async def verify_pos_api_key(x_pos_api_key: str = Header(...)):
 {
   "terminal_id": "TERM_001",
   "card_identifier": "CARD_2C53F730B5",
-  "bonus_amount": 30.00,
+  "bonus_amount": 200.00,
+  "purchase_amount": 1000.00,
   "idempotency_key": "spend-20260514-001"
 }
 ```
 
-> ⚠️ **Обов'язкові поля:** `terminal_id`, `card_identifier`, `bonus_amount`, `idempotency_key`
+> ⚠️ **Обов'язково вказувати `purchase_amount`** — для перевірки ліміту 50%.  
+> Якщо `bonus_amount > purchase_amount * 0.5` — HTTP 400.
 
 Відповідь:
 ```json
 {
   "success": true,
   "transaction_id": "uuid",
-  "bonus_spent": "30.00",
-  "new_balance": "120.00"
+  "bonus_spent": "200.00",
+  "new_balance": "0.00"
 }
 ```
 
-Якщо балансу недостатньо — HTTP 400:
+Помилки:
 ```json
-{"detail": "Insufficient bonus balance"}
+{"detail": "Можна списати максимум 50% від суми рахунку (500.00 грн)"}
+{"detail": "Недостатньо бонусів на балансі"}
 ```
 
 ---
 
 ## 8. Адміністрування правил
 
+> ℹ️ Ендпоінти `/admin/rules` залишені для сумісності. Поточна логіка нарахування **не залежить** від глобальних правил — ставка розраховується per-card автоматично.
+
 ### Переглянути всі правила
 
 **GET** `/admin/rules`
 
-### Створити правило нарахування
+### Створити правило
 
 **POST** `/admin/rules`
 
 ```json
 {
-  "name": "10% за покупку",
+  "name": "Базове правило",
   "type": "percentage",
   "value": 10,
-  "min_purchase": 50,
-  "max_bonus": 200,
+  "min_purchase": 0,
   "is_active": true
 }
 ```
-
-Варіанти `type`:
-- `"percentage"` — `value`% від суми покупки
-- `"fixed"` — фіксована сума `value` бонусів незалежно від суми
-- `"multiplier"` — сума × 0.01 × `value`
-
-### Деактивувати правило
-
-**DELETE** `/admin/rules/{rule_id}`
-
-Не видаляє фізично — встановлює `is_active = false`.
 
 ---
 
@@ -436,7 +422,7 @@ async def verify_pos_api_key(x_pos_api_key: str = Header(...)):
 ```bash
 cd project/mobile
 flutter pub get
-flutter run   # обирає підключений пристрій або емулятор
+flutter run
 ```
 
 ### Ключові файли
@@ -449,9 +435,7 @@ flutter run   # обирає підключений пристрій або ем
 | `lib/features/auth/data/auth_repository.dart` | Login, register, logout, getToken |
 | `lib/features/card/data/card_repository.dart` | getMyCard, createCard |
 | `lib/features/history/data/transaction_repository.dart` | getTransactions |
-| `lib/features/auth/presentation/login_screen.dart` | Екран входу |
-| `lib/features/card/presentation/card_screen.dart` | Головний екран з QR-кодом |
-| `lib/features/history/presentation/history_screen.dart` | Список транзакцій |
+| `lib/features/card/presentation/card_screen.dart` | Головний екран: QR, кешбек, прогрес-бар, 50% інфо |
 
 ### Потік авторизації
 
@@ -469,23 +453,71 @@ app.dart (_StartupGate)
 ```
 CardScreen.initState()
  └── cardRepository.getMyCard(token)
-      ├── успіх → показати картку
-      └── 404 → cardRepository.createCard(token) → показати нову картку
+      ├── успіх → показати картку (cashback_rate, transactions_count, balance)
+      └── 404 → cardRepository.createCard(token) → показати нову картку (3% кешбек)
 ```
+
+### UI-елементи картки (`card_screen.dart`)
+
+| Елемент | Що показує |
+|---|---|
+| Тайл "Рівень" | Рівень картки (standard/silver/gold) |
+| Тайл "Бонусів" | Поточний баланс |
+| Блок "Кешбек" | Поточна ставка % + `LinearProgressIndicator` 3%→12% |
+| Підпис прогресу | `"N рахунків закрито · наступний: X%"` або `"Максимальний рівень! 🎉"` |
+| Інфо-плашка | `"Списати бонусами можна до 50% від суми рахунку"` |
+| QR-код | Для сканування на POS |
+| Штрих-код | Альтернатива QR (показується за кнопкою) |
+
+### Кольорова схема прогресу кешбеку
+
+| Ставка | Колір |
+|---|---|
+| 3–6% | Синій `#005BBB` |
+| 7–9% | Зелений `#4CAF50` |
+| 10–12% | Золотий `#FFD700` |
 
 ### Підключення API
 
-Файл `lib/core/api_client.dart` — змінити `baseUrl` якщо потрібно:
-
+Файл `lib/core/api_client.dart`:
 ```dart
-// для локальної розробки на мобільному пристрої або емуляторі Android:
-// baseUrl = "http://10.0.2.2:8000"  (Android emulator → localhost)
-// baseUrl = "http://localhost:8000"  (iOS simulator або macOS)
+// Android emulator → localhost:
+// baseUrl = "http://10.0.2.2:8000"
+// iOS simulator або macOS:
+// baseUrl = "http://localhost:8000"
 ```
 
 ---
 
-## 10. Тестування
+## 10. Міграції бази даних
+
+Файл: `project/backend/alembic/versions/001_add_cashback_fields_to_bonus_cards.py`
+
+Додає два нові поля до таблиці `bonus_cards`:
+
+```python
+def upgrade() -> None:
+    op.add_column('bonus_cards',
+        sa.Column('cashback_rate', sa.Numeric(5, 2), nullable=False, server_default='3.00'))
+    op.add_column('bonus_cards',
+        sa.Column('transactions_count', sa.Integer(), nullable=False, server_default='0'))
+
+def downgrade() -> None:
+    op.drop_column('bonus_cards', 'transactions_count')
+    op.drop_column('bonus_cards', 'cashback_rate')
+```
+
+Запуск міграції (якщо використовується Alembic):
+```bash
+cd project/backend
+alembic upgrade head
+```
+
+> При використанні `docker compose up --build` з `Base.metadata.create_all()` — нові поля створюються автоматично для нових інсталяцій. Міграція потрібна для існуючих баз.
+
+---
+
+## 11. Тестування
 
 ### Автоматичні backend-тести
 
@@ -500,36 +532,17 @@ pytest -v
 - `tests/test_cards.py` — створення та отримання картки
 - `tests/test_pos_webhook.py` — перевірка API-ключа POS
 
-Приклад тесту POS:
-```python
-# tests/test_pos_webhook.py
-@pytest.mark.asyncio
-async def test_invalid_pos_api_key(client):
-    response = await client.post(
-        "/pos/webhook",
-        headers={"X-POS-API-Key": "wrong-key"},
-        json={
-            "terminal_id": "TERM_001",
-            "event_type": "purchase",
-            "card_identifier": "CARD_12345",
-            "purchase_amount": 100.0,
-            "idempotency_key": "idem-1",
-        },
-    )
-    assert response.status_code == 401
-```
-
 ### Flutter аналіз та тести
 
 ```bash
 cd project/mobile
-flutter analyze         # статичний аналіз (має бути "No issues found")
-flutter test            # запуск unit/widget тестів
+flutter analyze
+flutter test
 ```
 
 ---
 
-## 11. Покроковий сценарій ручного тестування
+## 12. Покроковий сценарій ручного тестування
 
 ### Крок 0. Запустити бекенд
 
@@ -538,7 +551,7 @@ cd project
 docker compose up --build
 ```
 
-Перевірити: http://localhost:8000/docs — відкриється Swagger UI з усіма ендпоінтами.
+Перевірити: http://localhost:8000/docs
 
 ---
 
@@ -558,31 +571,7 @@ curl -s -X POST http://localhost:8000/auth/register \
 
 ---
 
-### ⚠️ Важливо про правила нарахування
-
-Якщо активного правила немає — бонуси завжди будуть `0.00` (навіть якщо запит успішний).  
-Правило **обов'язково** потрібно створити **до** першої покупки.  
-Якщо ти вже надіслав POS-запит і отримав `bonus_earned: "0.00"` — просто створи правило і надішли запит ще раз з **новим** `idempotency_key`.
-
----
-
-### Крок 2. Створити правило нарахування бонусів
-
-```bash
-curl -s -X POST http://localhost:8000/admin/rules \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "10% від покупки",
-    "type": "percentage",
-    "value": 10,
-    "min_purchase": 0,
-    "is_active": true
-  }' | python3 -m json.tool
-```
-
----
-
-### Крок 3. Створити бонусну картку
+### Крок 2. Створити бонусну картку
 
 ```bash
 TOKEN="вставити_токен_з_кроку_1"
@@ -591,16 +580,15 @@ curl -s -X POST http://localhost:8000/cards/create \
   -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
 ```
 
-Зберегти `card_number` або `qr_code_data` (обидва можна використати як `card_identifier`).
+Відповідь містить `card_number`, `cashback_rate: "3.00"`, `transactions_count: 0`.  
+Зберегти `card_number` як `CARD`.
 
 ---
 
-### Крок 4. Симулювати покупку на POS (нарахування бонусів)
-
-> Отримати `card_number` з відповіді кроку 3, наприклад `CARD_2C53F730B5`
+### Крок 3. Симулювати першу покупку (ставка 3%)
 
 ```bash
-CARD="CARD_2C53F730B5"   # замінити на свій card_number
+CARD="CARD_2C53F730B5"
 
 curl -s -X POST http://localhost:8000/pos/webhook \
   -H "Content-Type: application/json" \
@@ -609,75 +597,73 @@ curl -s -X POST http://localhost:8000/pos/webhook \
     \"terminal_id\": \"TERM_001\",
     \"event_type\": \"purchase\",
     \"card_identifier\": \"$CARD\",
-    \"purchase_amount\": 500.00,
+    \"purchase_amount\": 1000.00,
     \"idempotency_key\": \"order-001\"
   }" | python3 -m json.tool
 ```
 
-> ❌ Помилка 422 = неправильні поля. Переконайся що використовуєш саме ці поля: `terminal_id`, `event_type`, `card_identifier`, `purchase_amount`, `idempotency_key`
-
-Очікuvana відповідь:
+Очікувана відповідь:
 ```json
 {
   "success": true,
-  "bonus_earned": "50.00",
-  "new_balance": "50.00"
+  "bonus_earned": "30.00",
+  "new_balance": "30.00",
+  "cashback_rate": "4.00",
+  "message": "Нараховано 30.00 бонусів (3% від 1000.00 грн). Наступна ставка: 4%"
 }
 ```
 
 ---
 
-### Крок 5. Перевірити баланс картки
+### Крок 4. Друга покупка (ставка вже 4%)
+
+```bash
+curl -s -X POST http://localhost:8000/pos/webhook \
+  -H "Content-Type: application/json" \
+  -H "X-POS-API-Key: pos-api-key-12345" \
+  -d "{
+    \"terminal_id\": \"TERM_001\",
+    \"event_type\": \"purchase\",
+    \"card_identifier\": \"$CARD\",
+    \"purchase_amount\": 1000.00,
+    \"idempotency_key\": \"order-002\"
+  }" | python3 -m json.tool
+```
+
+`bonus_earned: "40.00"`, `cashback_rate: "5.00"`.
+
+---
+
+### Крок 5. Перевірити баланс і ставку
 
 ```bash
 curl -s http://localhost:8000/cards/my \
   -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
 ```
 
-`balance` має бути `50.00`.
+Поля `cashback_rate` і `transactions_count` відображають поточний стан.
 
 ---
 
-### Крок 6. Симулювати ще одну покупку
+### Крок 6. Списати бонуси (з перевіркою 50% ліміту)
 
 ```bash
-curl -s -X POST http://localhost:8000/pos/webhook \
+# Рахунок 1000 грн → ліміт 500 бонусів
+curl -s -X POST http://localhost:8000/pos/spend \
   -H "Content-Type: application/json" \
   -H "X-POS-API-Key: pos-api-key-12345" \
   -d "{
     \"terminal_id\": \"TERM_001\",
-    \"event_type\": \"purchase\",
     \"card_identifier\": \"$CARD\",
+    \"bonus_amount\": 30.00,
     \"purchase_amount\": 1000.00,
-    \"idempotency_key\": \"order-002\"
+    \"idempotency_key\": \"spend-001\"
   }" | python3 -m json.tool
 ```
 
-Баланс стане `150.00`.
-
 ---
 
-### Крок 7. Перевірити ідемпотентність (захист від дублю)
-
-```bash
-# Повторити той самий запит з тим самим idempotency_key
-curl -s -X POST http://localhost:8000/pos/webhook \
-  -H "Content-Type: application/json" \
-  -H "X-POS-API-Key: pos-api-key-12345" \
-  -d "{
-    \"terminal_id\": \"TERM_001\",
-    \"event_type\": \"purchase\",
-    \"card_identifier\": \"$CARD\",
-    \"purchase_amount\": 1000.00,
-    \"idempotency_key\": \"order-002\"
-  }" | python3 -m json.tool
-```
-
-Баланс залишиться `150.00` — дублю немає.
-
----
-
-### Крок 8. Списати бонуси
+### Крок 7. Спроба списати більше 50% (очікується помилка)
 
 ```bash
 curl -s -X POST http://localhost:8000/pos/spend \
@@ -686,21 +672,40 @@ curl -s -X POST http://localhost:8000/pos/spend \
   -d "{
     \"terminal_id\": \"TERM_001\",
     \"card_identifier\": \"$CARD\",
-    \"bonus_amount\": 50.00,
-    \"idempotency_key\": \"spend-001\"
+    \"bonus_amount\": 600.00,
+    \"purchase_amount\": 1000.00,
+    \"idempotency_key\": \"spend-002\"
   }" | python3 -m json.tool
 ```
 
-> ⚠️ Поле називається `bonus_amount`, а не `amount`!
+Очікувана відповідь: HTTP 400 — `{"detail": "Можна списати максимум 50% від суми рахунку (500.00 грн)"}`
 
-Баланс стане `100.00`.
+---
+
+### Крок 8. Перевірити ідемпотентність
+
+```bash
+# Повторити order-001 — бонуси не нараховуються двічі
+curl -s -X POST http://localhost:8000/pos/webhook \
+  -H "Content-Type: application/json" \
+  -H "X-POS-API-Key: pos-api-key-12345" \
+  -d "{
+    \"terminal_id\": \"TERM_001\",
+    \"event_type\": \"purchase\",
+    \"card_identifier\": \"$CARD\",
+    \"purchase_amount\": 1000.00,
+    \"idempotency_key\": \"order-001\"
+  }" | python3 -m json.tool
+```
+
+Баланс не змінюється.
 
 ---
 
 ### Крок 9. Переглянути всі транзакції
 
 ```bash
-CARD_UUID="вставити_id_картки_з_кроку_3"
+CARD_UUID="вставити_id_картки"
 
 curl -s "http://localhost:8000/cards/$CARD_UUID/transactions" \
   -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
@@ -708,36 +713,10 @@ curl -s "http://localhost:8000/cards/$CARD_UUID/transactions" \
 
 ---
 
-### Крок 10. Тест невірного API ключа
-
-```bash
-curl -s -X POST http://localhost:8000/pos/webhook \
-  -H "X-POS-API-Key: wrong-key" \
-  -H "Content-Type: application/json" \
-  -d '{"terminal_id":"T","event_type":"purchase","card_identifier":"X","purchase_amount":100,"idempotency_key":"k1"}'
-```
-
-Відповідь: HTTP 401 — `{"detail": "Invalid POS API key"}`
-
----
-
 ## Swagger UI
 
-Після запуску `docker compose up` відкрити:  
-**http://localhost:8000/docs**
-
-Там можна тестувати всі ендпоінти через браузер без curl.
+Після запуску: **http://localhost:8000/docs**
 
 Для авторизації — натиснути "Authorize" → вставити токен у форму `bearerAuth`.
 
 ---
-
-## Відомі обмеження / що можна покращити
-
-| Що | Статус |
-|---|---|
-| Реєстрація POS-терміналів у БД | Не реалізовано — ключ один для всіх |
-| Рівні карток (silver/gold) | Поле є в БД, логіка підвищення не реалізована |
-| Push-сповіщення | Не реалізовано |
-| Адмін-авторизація | GET/POST /admin/rules відкриті для всіх |
-| Refresh token | Не реалізовано, токен живе 60 хвилин |
