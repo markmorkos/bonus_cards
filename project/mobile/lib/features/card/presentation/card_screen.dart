@@ -1,3 +1,5 @@
+import "dart:async";
+
 import "package:barcode_widget/barcode_widget.dart";
 import "package:flutter/material.dart";
 import "package:qr_flutter/qr_flutter.dart";
@@ -26,6 +28,9 @@ class _CardScreenState extends State<CardScreen> {
   bool _showBarcode = false;
   Map<String, dynamic>? _card;
   String? _error;
+  Timer? _refreshTimer;
+
+  static const _autoRefreshInterval = Duration(seconds: 30);
 
   static const double _cashbackMin = 3.0;
   static const double _cashbackMax = 12.0;
@@ -34,6 +39,13 @@ class _CardScreenState extends State<CardScreen> {
   void initState() {
     super.initState();
     _loadCard();
+    _refreshTimer = Timer.periodic(_autoRefreshInterval, (_) => _loadCard());
+  }
+
+  @override
+  void dispose() {
+    _refreshTimer?.cancel();
+    super.dispose();
   }
 
   Future<void> _loadCard() async {
@@ -158,6 +170,17 @@ class _CardScreenState extends State<CardScreen> {
       appBar: AppBar(
         title: Text(cardNumber.isNotEmpty ? "Картка $cardNumber" : "Картка"),
         actions: [
+          IconButton(
+            onPressed: _loading ? null : _loadCard,
+            icon: _loading
+                ? const SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                  )
+                : const Icon(Icons.refresh),
+            tooltip: "Оновити",
+          ),
           IconButton(
             onPressed: _logout,
             icon: const Icon(Icons.logout),

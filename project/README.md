@@ -1,25 +1,41 @@
 # Система цифрових бонусних карток
 
-Мобільний застосунок + серверна частина для цифрових бонусних карт з POS-інтеграцією.
+Мобільний застосунок + серверна частина для цифрових бонусних карт з POS-інтеграцією та прогресивною системою кешбеку.
 
 ---
 
 ## Як це працює
 
 ### З боку клієнта (покупець)
-1. **Реєстрація** — вводить email та пароль, отримує цифрову бонусну карту.
+1. **Реєстрація** — вводить email та пароль, автоматично отримує цифрову бонусну карту зі стартовою ставкою кешбеку **3%**.
 2. **Вхід** — авторизується за email та паролем.
-3. **Головний екран** — бачить свою карту: номер, QR-код, штрихкод, баланс бонусів, рівень.
-4. **Пред'явлення на касі** — показує QR-код або штрихкод, касир сканує → бонуси нараховуються.
-5. **Історія транзакцій** — переглядає нарахування та списання бонусів.
-6. **Вихід** — кнопка виходу зі збереженням даних.
+3. **Головний екран** — бачить свою карту: номер, QR-код, штрихкод, баланс бонусів, рівень, **поточну ставку кешбеку** та прогрес до максимальної ставки.
+4. **Пред'явлення на касі** — показує QR-код або штрихкод, касир сканує → бонуси нараховуються за поточною ставкою → ставка автоматично підвищується після кожного рахунку.
+5. **Прогресія кешбеку** — починається з 3%, збільшується на 1% з кожним закритим рахунком, максимум 12%.
+6. **Списання бонусів** — здійснюється через термінал, максимум **50% від суми рахунку**.
+7. **Історія транзакцій** — переглядає нарахування та списання бонусів.
+8. **Вихід** — кнопка виходу зі збереженням даних.
 
 ### З боку сервера
-- Нарахування бонусів за правилами (відсоток від суми покупки).
+- **Прогресивний кешбек** — ставка per-card: 3% → 4% → ... → 12% (максимум).
+- **50% ліміт списання** — не можна списати більше половини суми рахунку.
 - Захист від дублів транзакцій через `idempotency_key`.
 - JWT-авторизація для мобільного клієнта.
 - API-ключ для POS-терміналів.
-- Адміністрування правил нарахування.
+
+---
+
+## Прогресія кешбеку
+
+| Рахунків закрито | Ставка кешбеку |
+|---|---|
+| 0 (нова картка) | 3% |
+| 1 | 4% |
+| 2 | 5% |
+| ... | ... |
+| 9+ | 12% (максимум) |
+
+> Приклад: рахунок на 1000 грн при ставці 10% → нараховується 100 бонусів.
 
 ---
 
@@ -31,7 +47,8 @@
 | Backend | FastAPI / Python 3.12 |
 | БД | PostgreSQL 16 |
 | Кеш | Redis 7 |
-| Інфра | Docker Compose |
+| Міграції | Alembic |
+| Інфра | Docker Compose (локально) / Render.com (prod) |
 
 ---
 
@@ -46,12 +63,13 @@ project/
 │   │   ├── routers/  — Ендпоінти
 │   │   ├── services/ — Бізнес-логіка
 │   │   └── main.py   — Точка входу
+│   ├── alembic/      — Міграції БД
 │   └── tests/        — Тести
 ├── mobile/           — Flutter застосунок
 │   └── lib/
 │       ├── features/
 │       │   ├── auth/      — Авторизація
-│       │   ├── card/      — Карта
+│       │   ├── card/      — Карта (кешбек, прогрес, QR)
 │       │   └── history/   — Історія
 │       └── core/     — HTTP клієнт, сховище токену
 └── docker-compose.yml
@@ -64,7 +82,7 @@ project/
 ### Що потрібно встановити
 1. **Docker Desktop** — https://www.docker.com/products/docker-desktop
 2. **Flutter SDK** — https://docs.flutter.dev/get-started/install/macos/mobile-ios
-4. **CocoaPods** — `sudo gem install cocoapods`
+3. **CocoaPods** — `sudo gem install cocoapods`
 
 ### 1. Запуск backend (PostgreSQL + Redis + FastAPI)
 
@@ -74,6 +92,9 @@ docker compose up --build
 ```
 
 Перевірка: http://localhost:8000/health
+
+> **Production backend:** https://bonus-cards-back.onrender.com  
+> Swagger UI: https://bonus-cards-back.onrender.com/docs
 
 ### 2. Запуск мобільного застосунку на iOS Simulator
 
@@ -125,6 +146,8 @@ docker compose up --build
 
 Перевірка: http://localhost:8000/health
 
+> **Production backend:** https://bonus-cards-back.onrender.com
+
 ### 2. Запуск мобільного застосунку на Android емуляторі
 
 ```powershell
@@ -159,14 +182,14 @@ flutter run -d <EMULATOR_ID>
 | Метод | URL | Опис |
 |---|---|---|
 | POST | `/cards/create` | Створити карту |
-| GET | `/cards/my` | Моя карта |
+| GET | `/cards/my` | Моя карта (включає `cashback_rate`, `transactions_count`) |
 | GET | `/cards/{id}/transactions` | Транзакції |
 
 ### POS
 | Метод | URL | Опис |
 |---|---|---|
-| POST | `/pos/webhook` | Нарахування бонусів |
-| POST | `/pos/spend` | Списання бонусів |
+| POST | `/pos/webhook` | Нарахування бонусів (повертає нову ставку кешбеку) |
+| POST | `/pos/spend` | Списання бонусів (макс. 50% від рахунку) |
 
 ### Адмін
 | Метод | URL | Опис |
@@ -184,18 +207,30 @@ flutter run -d <EMULATOR_ID>
 
 ```bash
 # Реєстрація
-curl -X POST http://localhost:8000/auth/register \
+curl -X POST https://bonus-cards-back.onrender.com/auth/register \
   -H "Content-Type: application/json" \
   -d '{"email":"test@test.com","password":"secret123","full_name":"Test User"}'
 
 # Вхід
-curl -X POST http://localhost:8000/auth/login \
+curl -X POST https://bonus-cards-back.onrender.com/auth/login \
   -H "Content-Type: application/json" \
   -d '{"email":"test@test.com","password":"secret123"}'
 
 # Створити карту (замінити TOKEN)
-curl -X POST http://localhost:8000/cards/create \
+curl -X POST https://bonus-cards-back.onrender.com/cards/create \
   -H "Authorization: Bearer TOKEN"
+
+# Симулювати покупку на POS (нарахування + підвищення ставки)
+curl -X POST https://bonus-cards-back.onrender.com/pos/webhook \
+  -H "Content-Type: application/json" \
+  -H "X-POS-API-Key: pos-api-key-12345" \
+  -d '{"terminal_id":"TERM_001","event_type":"purchase","card_identifier":"CARD_XXX","purchase_amount":1000.00,"idempotency_key":"order-001"}'
+
+# Списати бонуси (max 50% від рахунку — тут рахунок 1000 грн, ліміт 500 бонусів)
+curl -X POST https://bonus-cards-back.onrender.com/pos/spend \
+  -H "Content-Type: application/json" \
+  -H "X-POS-API-Key: pos-api-key-12345" \
+  -d '{"terminal_id":"TERM_001","card_identifier":"CARD_XXX","bonus_amount":100.00,"purchase_amount":1000.00,"idempotency_key":"spend-001"}'
 ```
 
 ### Backend тести
@@ -214,3 +249,4 @@ pytest -q
 - POS інтеграція потребує заголовок **X-POS-API-Key**.
 - Ідемпотентність транзакцій забезпечується через `idempotency_key`.
 - При першому запуску таблиці бази даних створюються автоматично.
+- Міграція `alembic/versions/001_add_cashback_fields_to_bonus_cards.py` додає поля `cashback_rate` та `transactions_count` до існуючих карток.
